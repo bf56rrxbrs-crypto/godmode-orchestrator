@@ -1,166 +1,153 @@
 #!/usr/bin/env python3
 """
-Value-Aware GODMODE Agent
--------------------------
-Default: only invoke full skills when they add value.
-Override: --force / FORCE_GODMODE=1 bypasses the router.
-
-Full-skill path uses multi_perspective.synthesize (two-phase by default)
-so Final Synthesis is enforced, not merely prompted.
+Value-Aware GODMODE Agent (optimized)
+-------------------------------------
+- Heuristic router by default (0 extra LLM calls)
+- Optional --llm-router for borderline confirmation
+- Full path: multi_perspective single-pass + repair
+- Tip embedded in synthesis call (no third call)
+- Auto domain detect from query
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
+import re
 
-from openai import OpenAI
-from dotenv import load_dotenv
+from lib import append_memory, chat, detect_domain, load_config, load_skill
+from multi_perspective import has_final_synthesis, synthesize
 
-load_dotenv()
+# Strong signals → always full path (no LLM router needed)
+STRONG_SIGNALS = [
+    r"\bshould i\b", r"\brecommend\b", r"\btrade-?offs?\b", r"\bpros and cons\b",
+    r"\banaly[sz]e\b", r"\bcompare\b", r"\bdecide\b", r"\bstrateg(y|ic)\b",
+    r"\barchitect\b", r"\bmigrate\b", r"\brefine\b", r"\bimprove\b",
+    r"\becu\b", r"\bafr\b", r"\btun(e|ing)\b", r"\bgrom\b", r"\bminix\b",
+    r"\bgodmode\b", r"\blanggraph\b", r"\bmulti-?perspective\b",
+]
 
-client = OpenAI(
-    api_key=os.getenv("XAI_API_KEY") or os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("BASE_URL", "https://api.x.ai/v1"),
-)
-
-ROOT = Path(__file__).parent
-SKILLS_DIR = ROOT / "skills"
-MEMORY_DIR = ROOT / "memory"
-MEMORY_DIR.mkdir(exist_ok=True)
-
-VALUE_SIGNALS = [
-    "refine", "improve", "analyze", "compare", "decide", "recommend",
-    "trade-off", "pros", "cons", "strategy", "best way", "should i",
-    "ecu", "tune", "mapping", "prompt", "system", "agent", "tot", "got",
-    "multi-perspective", "synthesis", "complex", "architecture",
-    "godmode", "force",
+WEAK_SKIP = [
+    r"^(hi|hello|hey|thanks|ok|okay|yes|no)\b",
+    r"\bwhat is the capital\b", r"\bdefine\b", r"\bwho (is|was)\b",
 ]
 
 
-def load_skill(name: str) -> str:
-    path = SKILLS_DIR / f"{name}.md"
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+def should_use_skills(query: str, llm_router: bool = False) -> tuple[bool, str]:
+    q = query.strip()
+    ql = q.lower()
 
+    for pat in WEAK_SKIP:
+        if re.search(pat, ql):
+            return False, "Simple / low-value pattern"
 
-def should_use_skills(query: str) -> tuple[bool, str]:
-    q = query.lower()
-    heuristic_hit = any(s in q for s in VALUE_SIGNALS) or len(query.split()) > 25
+    strong = any(re.search(p, ql) for p in STRONG_SIGNALS)
+    longish = len(q.split()) > 22
 
-    if not heuristic_hit:
-        return False, "Simple or low-complexity query"
+    if strong:
+        return True, "Strong value signal"
+    if not longish and not strong:
+        return False, "No high-value signal"
 
-    decision_prompt = f"""Does this query benefit from full multi-perspective analysis + high-capacity reasoning (GODMODE style)?
-Answer with exactly:
+    # Borderline: long query without strong keywords
+    if not llm_router:
+        return True, "Length/complexity heuristic"
+
+    decision_prompt = f"""Does this query benefit from multi-perspective + high-capacity reasoning?
+Answer exactly:
 USE: yes or no
 REASON: one short sentence
 
 Query: {query}"""
     try:
-        resp = client.chat.completions.create(
-            model=os.getenv("MODEL", "grok-4"),
-            messages=[{"role": "user", "content": decision_prompt}],
+        text = chat(
+            "You are a strict routing classifier. Prefer no unless analysis clearly helps.",
+            decision_prompt,
+            max_tokens=60,
             temperature=0.0,
-            max_tokens=80,
-        )
-        text = (resp.choices[0].message.content or "").strip().lower()
+        ).lower()
         use = "yes" in text.split("use:")[-1][:15]
-        reason = text.split("reason:")[-1].strip() if "reason:" in text else "Heuristic + LLM decision"
+        reason = text.split("reason:")[-1].strip() if "reason:" in text else "LLM router"
         return use, reason
     except Exception:
-        return heuristic_hit, "Heuristic only (LLM decision failed)"
+        return True, "Borderline — heuristic fallback"
 
 
-def run_full_skills(query: str, forced: bool = False, domain: str | None = None) -> str:
-    """Full path: multi-perspective two-phase synthesis + tip."""
-    try:
-        from multi_perspective import synthesize, has_final_synthesis
-    except ImportError:
-        synthesize = None
-        has_final_synthesis = lambda t: "final synthesis" in t.lower()
-
-    if synthesize is not None:
-        body = synthesize(query, domain=domain, two_phase=True)
-    else:
-        # Fallback single call if module missing
-        godmode = load_skill("GODMODE")
-        multi = load_skill("MultiPerspectiveSynthesizer")
-        force_card = load_skill("FORCE_GODMODE") if forced else ""
-        system = "\n\n---\n\n".join(p for p in (force_card, godmode, multi) if p)
-        user = f"Apply MultiPerspectiveSynthesizer fully to:\n\n{query}\n\nMandatory Final Synthesis."
-        resp = client.chat.completions.create(
-            model=os.getenv("MODEL", "grok-4"),
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.35,
-            max_tokens=2000,
-        )
-        body = resp.choices[0].message.content or ""
-
-    tip_block = ""
-    try:
-        tip = client.chat.completions.create(
-            model=os.getenv("MODEL", "grok-4"),
-            messages=[{
-                "role": "user",
-                "content": f"One actionable prompt-improvement tip for someone who asked: {query}\nReply with one sentence only, no preamble.",
-            }],
-            temperature=0.4,
-            max_tokens=120,
-        )
-        tip_text = (tip.choices[0].message.content or "").strip()
-        if tip_text:
-            tip_block = f"\n\n---\n**Prompt tip:** {tip_text}"
-    except Exception:
-        pass
-
-    out = body + tip_block
+def run_full_skills(
+    query: str,
+    *,
+    forced: bool = False,
+    domain: str | None = None,
+    two_phase: bool | None = None,
+) -> str:
+    body = synthesize(query, domain=domain, two_phase=two_phase)
+    out = body
     if forced and not out.lstrip().startswith("[FORCE GODMODE]"):
         out = f"[FORCE GODMODE]\n\n{out}"
-    if synthesize is not None and not has_final_synthesis(out):
-        out += "\n\n_Note: synthesis validator did not detect Final Synthesis markers._"
+    if not has_final_synthesis(out):
+        out += "\n\n_Note: Final Synthesis markers not detected._"
     return out
 
 
 def value_aware_agent(
     query: str,
+    *,
     force: bool = False,
     domain: str | None = None,
+    llm_router: bool | None = None,
+    two_phase: bool | None = None,
 ) -> str:
+    cfg = load_config()
     env_force = os.getenv("FORCE_GODMODE", "").strip().lower() in {"1", "true", "yes", "on"}
     forced = force or env_force
+    if domain is None:
+        domain = detect_domain(query)
+    if llm_router is None:
+        llm_router = bool(cfg.get("llm_router", False))
 
     if forced:
-        print("[Value Decision] Use skills: True | Reason: FORCE GODMODE override")
-        result = run_full_skills(query, forced=True, domain=domain)
-        return f"**Skills activated** (FORCE GODMODE override)\n\n{result}"
+        print(f"[Router] FORCE | domain={domain or '-'}")
+        result = run_full_skills(query, forced=True, domain=domain, two_phase=two_phase)
+        append_memory(query, result, domain=domain)
+        return f"**Skills activated** (FORCE GODMODE)\n\n{result}"
 
-    use, reason = should_use_skills(query)
-    print(f"[Value Decision] Use skills: {use} | Reason: {reason}")
+    use, reason = should_use_skills(query, llm_router=llm_router)
+    print(f"[Router] use={use} | {reason} | domain={domain or '-'}")
 
     if use:
-        result = run_full_skills(query, forced=False, domain=domain)
+        result = run_full_skills(query, forced=False, domain=domain, two_phase=two_phase)
+        append_memory(query, result, domain=domain)
         return f"**Skills activated** ({reason})\n\n{result}"
 
-    resp = client.chat.completions.create(
-        model=os.getenv("MODEL", "grok-4"),
-        messages=[{"role": "user", "content": query}],
-        temperature=0.5,
+    text = chat(
+        "You are a precise, concise assistant. Answer directly.",
+        query,
         max_tokens=800,
+        temperature=0.4,
     )
-    return f"**Skills skipped for efficiency** ({reason})\n\n{resp.choices[0].message.content}"
+    return f"**Skills skipped** ({reason})\n\n{text}"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Value-Aware GODMODE agent with Force override")
+    parser = argparse.ArgumentParser(description="Value-Aware GODMODE (optimized)")
     parser.add_argument("query", nargs="*", help="Task / question")
-    parser.add_argument("--force", action="store_true", help="Force GODMODE: bypass router")
-    parser.add_argument("--domain", default=None, help="Optional domain bias")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--domain", default=None)
+    parser.add_argument("--llm-router", action="store_true", help="Use LLM for borderline routing")
+    parser.add_argument("--two-phase", action="store_true")
     args = parser.parse_args()
     query = " ".join(args.query) if args.query else (
-        "Should I switch my personal agent system from sequential to LangGraph for better state handling?"
+        "Should I switch my personal agent system from sequential to LangGraph?"
     )
-    print(value_aware_agent(query, force=args.force, domain=args.domain))
+    print(
+        value_aware_agent(
+            query,
+            force=args.force,
+            domain=args.domain,
+            llm_router=True if args.llm_router else None,
+            two_phase=True if args.two_phase else None,
+        )
+    )
 
 
 if __name__ == "__main__":
